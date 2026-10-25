@@ -6,6 +6,7 @@ from config.settings import Settings
 from bot.middlewares.i18n import JsonI18n
 from bot.services.yookassa_service import YooKassaService
 from bot.services.panel_api_service import PanelApiService
+from bot.services import panel_identity
 from bot.services.subscription_service import SubscriptionService
 from bot.services.referral_service import ReferralService
 from bot.services.promo_code_service import PromoCodeService
@@ -25,6 +26,8 @@ def build_core_services(
     i18n: JsonI18n,
     bot_username_for_default_return: str,
 ):
+    # Every PanelApiService (including ad-hoc ones in handlers) resolves panel 3.x ids through this.
+    panel_identity.configure(panel_identity.DbIdentityStore(async_session_factory))
     panel_service = PanelApiService(settings)
     subscription_service = SubscriptionService(settings, panel_service, bot, i18n)
     referral_service = ReferralService(settings, subscription_service, bot, i18n)

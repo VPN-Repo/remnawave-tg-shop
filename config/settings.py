@@ -204,6 +204,8 @@ class Settings(BaseSettings):
 
     PANEL_API_URL: Optional[str] = None
     PANEL_API_KEY: Optional[str] = None
+    # auto (default) asks the panel its version; v2 = 2.x (users by uuid), v3 = 3.x (numeric id).
+    PANEL_API_VERSION: str = Field(default="auto")
     USER_TRAFFIC_LIMIT_GB: Optional[float] = Field(default=0.0)
     USER_TRAFFIC_STRATEGY: str = Field(default="NO_RESET")
     USER_SQUAD_UUIDS: Optional[str] = Field(

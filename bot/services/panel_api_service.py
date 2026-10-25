@@ -12,6 +12,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from config.settings import Settings
 from db.dal import panel_sync_dal
 from db.models import PanelSyncStatus
+from bot.services import panel_identity
+
+# Remnawave 3.x: users have a numeric id and no uuid; dialect-specific shapes live in this class
+# only, callers keep passing the bot's reference (users.panel_user_uuid) everywhere.
+_PANEL_V3_MAJOR = 3
 
 
 class PanelApiService:
@@ -22,6 +27,10 @@ class PanelApiService:
         self.api_key = settings.PANEL_API_KEY
         self._session: Optional[aiohttp.ClientSession] = None
         self.default_client_ip = "127.0.0.1"
+        self._is_v3_cached: Optional[bool] = None
+        # bot reference -> panel numeric id, and back; filled lazily on 3.x
+        self._id_by_ref: Dict[str, int] = {}
+        self._ref_by_id: Dict[int, str] = {}
 
     async def __aenter__(self):
         """Context manager entry"""
@@ -222,6 +231,109 @@ class PanelApiService:
                 "message": f"Unexpected error: {str(e)}"
             }
 
+    # ---------- Remnawave 3.x identity helpers ----------
+
+    async def is_v3(self) -> bool:
+        """Panel 3.x identifies users by numeric id. Pinned via PANEL_API_VERSION or probed once."""
+        if self._is_v3_cached is not None:
+            return self._is_v3_cached
+        pinned = (getattr(self.settings, "PANEL_API_VERSION", "auto") or "auto").strip().lower()
+        if pinned in ("v2", "v3"):
+            self._is_v3_cached = pinned == "v3"
+            return self._is_v3_cached
+        data = await self._request("GET", "/system/metadata", log_full_response=False)
+        if not data or data.get("error"):
+            logging.warning("Panel API: /system/metadata unavailable; assuming 2.x for this call")
+            return False  # not cached: a panel restart must not pin the wrong dialect
+        version = str((data.get("response") or {}).get("version") or "")
+        major = version.split(".")[0]
+        self._is_v3_cached = major.isdigit() and int(major) >= _PANEL_V3_MAJOR
+        logging.info(f"Panel API: detected panel version {version or '?'} -> {'v3' if self._is_v3_cached else 'v2'} dialect")
+        return self._is_v3_cached
+
+    def _remember(self, ref: str, panel_id: int) -> None:
+        self._id_by_ref[ref] = panel_id
+        self._ref_by_id[panel_id] = ref
+
+    async def _resolve_panel_id(self, ref: Any) -> Optional[int]:
+        """Bot reference -> panel numeric id (3.x). Digits are an id already; legacy uuids are
+        looked up in the local DB and, failing that, on the panel by the deterministic
+        username tg_<telegram_id> / telegramId, then persisted."""
+        ref = str(ref or "").strip()
+        if not ref:
+            return None
+        if panel_identity.is_numeric_ref(ref):
+            return int(ref)
+        if ref in self._id_by_ref:
+            return self._id_by_ref[ref]
+        store = panel_identity.get_store()
+        if store is None:
+            return None
+        panel_id = await store.get_panel_id(ref)
+        if panel_id is None:
+            telegram_id = await store.get_telegram_id(ref)
+            if telegram_id is not None:
+                user = await self._fetch_v3_user(username=f"tg_{telegram_id}")
+                if not user:
+                    user = await self._fetch_v3_user(telegram_id=telegram_id)
+                if user and user.get("id") is not None:
+                    panel_id = int(user["id"])
+                    await store.save_panel_id(ref, panel_id)
+        if panel_id is None:
+            logging.warning(f"Panel API: cannot resolve panel id for reference {ref}")
+            return None
+        self._remember(ref, int(panel_id))
+        return int(panel_id)
+
+    async def _fetch_v3_user(self, *, username: Optional[str] = None,
+                             telegram_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        if username:
+            data = await self._request("GET", f"/users/by-username/{username}", log_full_response=False)
+            resp = data.get("response") if data and not data.get("error") else None
+            return resp if isinstance(resp, dict) else None
+        if telegram_id is not None:
+            data = await self._request("GET", "/users/stream",
+                                       params={"telegramId": str(telegram_id), "size": 2},
+                                       log_full_response=False)
+            users = (data.get("response") or {}).get("users") if data and not data.get("error") else None
+            return users[0] if users else None
+        return None
+
+    async def _user_path_id(self, ref: Any) -> Optional[str]:
+        """Path segment for /users/{...} and /hwid/devices/{...}: uuid on 2.x, numeric id on 3.x."""
+        if not await self.is_v3():
+            return str(ref)
+        panel_id = await self._resolve_panel_id(ref)
+        return None if panel_id is None else str(panel_id)
+
+    async def _with_ref(self, user: Any, ref: Optional[str] = None) -> Any:
+        """3.x user objects carry no uuid: put the bot's reference there so callers keep working.
+        Known users get their stored reference back; unknown ones get the id as a string."""
+        if not isinstance(user, dict) or user.get("uuid") or user.get("id") is None:
+            return user
+        panel_id = int(user["id"])
+        if ref is None:
+            ref = self._ref_by_id.get(panel_id)
+        store = panel_identity.get_store()
+        if ref is None and store is not None:
+            ref = await store.get_ref_by_panel_id(panel_id)
+            if ref is None and user.get("telegramId") is not None:
+                try:
+                    ref = await store.get_ref_by_telegram_id(int(user["telegramId"]))
+                except (TypeError, ValueError):
+                    ref = None
+                if ref:
+                    await store.save_panel_id(ref, panel_id)
+        if not ref:
+            ref = str(panel_id)
+        self._remember(ref, panel_id)
+        return {**user, "uuid": ref}
+
+    async def _with_refs(self, users: Any) -> Any:
+        if not isinstance(users, list) or not await self.is_v3():
+            return users
+        return [await self._with_ref(u) for u in users]
+
     async def get_all_panel_users(
             self,
             page_size: int = 100,
@@ -243,7 +355,7 @@ class PanelApiService:
                 return None
             users_batch = response_data.get("response", {}).get("users", [])
             if not users_batch: break
-            all_users.extend(users_batch)
+            all_users.extend(await self._with_refs(users_batch))
             if len(users_batch) < page_size: break
             start_offset += page_size
             await asyncio.sleep(0.1)
@@ -254,13 +366,16 @@ class PanelApiService:
             self,
             user_uuid: str,
             log_response: bool = True) -> Optional[Dict[str, Any]]:
-        endpoint = f"/users/{user_uuid}"
+        path_id = await self._user_path_id(user_uuid)
+        if path_id is None:
+            return None
+        endpoint = f"/users/{path_id}"
         full_response = await self._request("GET",
                                             endpoint,
                                             log_full_response=log_response)
         if full_response and not full_response.get(
                 "error") and "response" in full_response:
-            return full_response.get("response")
+            return await self._with_ref(full_response.get("response"), str(user_uuid))
 
         return None
 
@@ -296,21 +411,34 @@ class PanelApiService:
         response_data = None
         filter_used_log = "No filter specified"
 
-        if telegram_id is not None:
-            filter_used_log = f"telegramId={telegram_id}"
-            endpoint = f"/users/by-telegram-id/{telegram_id}"
-            response_data = await self._request("GET",
-                                                endpoint,
-                                                log_full_response=log_response)
+        v3 = await self.is_v3()
 
-            if response_data and not response_data.get(
-                    "error") and "response" in response_data and isinstance(
-                        response_data["response"], list):
-                return response_data["response"]
-            elif response_data and response_data.get("errorCode") == "A062":
-                logging.info(
-                    f"Panel API: Users not found for {filter_used_log}")
-                return []
+        if telegram_id is not None or (email is not None and v3):
+            # 3.x dropped /users/by-telegram-id and /users/by-email; /users/stream filters instead.
+            if v3:
+                stream_filter = {"telegramId": str(telegram_id)} if telegram_id is not None else {"email": email}
+                filter_used_log = "&".join(f"{k}={v}" for k, v in stream_filter.items())
+                response_data = await self._request("GET", "/users/stream",
+                                                    params={**stream_filter, "size": 50},
+                                                    log_full_response=log_response)
+                if response_data and not response_data.get("error") and "response" in response_data:
+                    users = (response_data.get("response") or {}).get("users") or []
+                    return await self._with_refs(users)
+            else:
+                filter_used_log = f"telegramId={telegram_id}"
+                endpoint = f"/users/by-telegram-id/{telegram_id}"
+                response_data = await self._request("GET",
+                                                    endpoint,
+                                                    log_full_response=log_response)
+
+                if response_data and not response_data.get(
+                        "error") and "response" in response_data and isinstance(
+                            response_data["response"], list):
+                    return response_data["response"]
+                elif response_data and response_data.get("errorCode") == "A062":
+                    logging.info(
+                        f"Panel API: Users not found for {filter_used_log}")
+                    return []
 
         elif username is not None:
             filter_used_log = f"username={username}"
@@ -322,7 +450,7 @@ class PanelApiService:
             if response_data and not response_data.get(
                     "error") and "response" in response_data and isinstance(
                         response_data["response"], dict):
-                return [response_data["response"]]
+                return [await self._with_ref(response_data["response"])] if v3 else [response_data["response"]]
             elif response_data and response_data.get("errorCode") == "A062":
                 logging.info(
                     f"Panel API: User not found for {filter_used_log}")
@@ -423,6 +551,8 @@ class PanelApiService:
                                        json=payload,
                                        log_full_response=log_response)
         if response and not response.get("error") and "response" in response:
+            if await self.is_v3():
+                response = {**response, "response": await self._with_ref(response.get("response"))}
             logging.info(
                 f"Panel user '{username_on_panel}' created successfully (UUID: {response.get('response',{}).get('uuid')})."
             )
@@ -441,7 +571,14 @@ class PanelApiService:
             user_uuid: str,
             update_payload: Dict[str, Any],
             log_response: bool = True) -> Optional[Dict[str, Any]]:
-        if 'uuid' not in update_payload:
+        if await self.is_v3():
+            # PATCH /users identifies the user by numeric id on 3.x.
+            panel_id = await self._resolve_panel_id(update_payload.pop('uuid', None) or user_uuid)
+            if panel_id is None:
+                logging.error(f"Failed to update user {user_uuid}: panel id unknown.")
+                return None
+            update_payload['id'] = panel_id
+        elif 'uuid' not in update_payload:
             update_payload['uuid'] = user_uuid
 
         full_response = await self._request("PATCH",
@@ -466,7 +603,11 @@ class PanelApiService:
                                           enable: bool,
                                           log_response: bool = True) -> bool:
         action = "enable" if enable else "disable"
-        endpoint = f"/users/{user_uuid}/actions/{action}"
+        path_id = await self._user_path_id(user_uuid)
+        if path_id is None:
+            logging.error(f"Failed to {action} user {user_uuid}: panel id unknown.")
+            return False
+        endpoint = f"/users/{path_id}/actions/{action}"
         response_data = await self._request("POST",
                                             endpoint,
                                             log_full_response=log_response)
@@ -495,7 +636,11 @@ class PanelApiService:
                                      user_uuid: str,
                                      log_response: bool = True) -> bool:
         """Delete a user from the panel. Treat not-found as already deleted."""
-        endpoint = f"/users/{user_uuid}"
+        path_id = await self._user_path_id(user_uuid)
+        if path_id is None:
+            logging.info(f"Panel user {user_uuid} has no panel id (3.x); treating as already deleted.")
+            return True
+        endpoint = f"/users/{path_id}"
         response_data = await self._request(
             "DELETE", endpoint, log_full_response=log_response
         )
@@ -536,7 +681,11 @@ class PanelApiService:
         return base_sub_url
 
     async def get_user_devices(self, user_uuid: str) -> Optional[List[Dict[str, Any]]]:
-        endpoint = f"/hwid/devices/{user_uuid}"
+        path_id = await self._user_path_id(user_uuid)
+        if path_id is None:
+            logging.error(f"Failed to get user devices for user {user_uuid}: panel id unknown.")
+            return None
+        endpoint = f"/hwid/devices/{path_id}"
         response_data = await self._request("GET", endpoint, log_full_response=False)
         if response_data and not response_data.get("error") and "response" in response_data:
             return response_data.get("response")
@@ -547,10 +696,17 @@ class PanelApiService:
 
     async def disconnect_device(self, user_uuid: str, hwid: str) -> bool:
         endpoint = f"/hwid/devices/delete"
-        payload = {
-            "userUuid": user_uuid,
-            "hwid": hwid
-        }
+        if await self.is_v3():
+            panel_id = await self._resolve_panel_id(user_uuid)
+            if panel_id is None:
+                logging.error(f"Failed to disconnect device {hwid} for user {user_uuid}: panel id unknown.")
+                return False
+            payload: Dict[str, Any] = {"userId": panel_id, "hwid": hwid}
+        else:
+            payload = {
+                "userUuid": user_uuid,
+                "hwid": hwid
+            }
         response_data = await self._request("POST", endpoint, json=payload, log_full_response=False)
         if response_data and not response_data.get("error") and "response" in response_data:
             return True
@@ -599,6 +755,9 @@ class PanelApiService:
 
         Returns the encrypted link string or None if encryption failed.
         """
+        if await self.is_v3():
+            logging.info("Panel 3.x has no /system/tools/happ/encrypt; using the raw link.")
+            return None
         payload = {"linkToEncrypt": link_to_encrypt}
         response_data = await self._request(
             "POST",
