@@ -157,25 +157,26 @@ async def on_startup_configured(dispatcher: Dispatcher):
             exc_info=True,
         )
 
-    # Automatic sync on startup
-    try:
-        logging.info("STARTUP: Running automatic panel sync...")
-        
-        async with async_session_factory() as session:
-            sync_result = await perform_sync(
-                panel_service=panel_service,
-                session=session,
-                settings=settings,
-                i18n_instance=i18n_instance
-            )
-            
-        if sync_result.get("status") == "completed":
-            logging.info(f"STARTUP: Automatic sync completed successfully. Details: {sync_result.get('details', 'N/A')}")
-        else:
-            logging.warning(f"STARTUP: Automatic sync completed with issues. Status: {sync_result.get('status', 'unknown')}")
-            
-    except Exception as e:
-        logging.error(f"STARTUP: Failed to run automatic sync: {e}", exc_info=True)
+    # Automatic sync on startup. It walks every panel user (hundreds of thousands here), so it
+    # runs in the background: the webhook server must not wait for it.
+    async def _startup_sync() -> None:
+        try:
+            logging.info("STARTUP: Running automatic panel sync (background)...")
+            async with async_session_factory() as session:
+                sync_result = await perform_sync(
+                    panel_service=panel_service,
+                    session=session,
+                    settings=settings,
+                    i18n_instance=i18n_instance
+                )
+            if sync_result.get("status") == "completed":
+                logging.info(f"STARTUP: Automatic sync completed successfully. Details: {sync_result.get('details', 'N/A')}")
+            else:
+                logging.warning(f"STARTUP: Automatic sync completed with issues. Status: {sync_result.get('status', 'unknown')}")
+        except Exception as e:
+            logging.error(f"STARTUP: Failed to run automatic sync: {e}", exc_info=True)
+
+    dispatcher["startup_sync_task"] = asyncio.create_task(_startup_sync())
 
     logging.info("STARTUP: Bot on_startup_configured completed.")
 

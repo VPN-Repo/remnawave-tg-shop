@@ -339,6 +339,35 @@ class PanelApiService:
             return users
         return [await self._with_ref(u) for u in users]
 
+    async def _with_refs_bulk(self, users: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Like _with_refs for whole-panel listings: one DB pass instead of two queries per user
+        (the startup sync walks every panel user; per-user lookups kept the web server from starting)."""
+        if not users or not await self.is_v3():
+            return users
+        store = panel_identity.get_store()
+        by_panel_id: Dict[int, str] = dict(self._ref_by_id)
+        by_telegram: Dict[int, str] = {}
+        if store is not None:
+            db_by_id, by_telegram = await store.load_all()
+            by_panel_id.update(db_by_id)
+        out = []
+        for u in users:
+            if not isinstance(u, dict) or u.get("uuid") or u.get("id") is None:
+                out.append(u)
+                continue
+            panel_id = int(u["id"])
+            ref = by_panel_id.get(panel_id)
+            if ref is None and u.get("telegramId") is not None:
+                try:
+                    ref = by_telegram.get(int(u["telegramId"]))
+                except (TypeError, ValueError):
+                    ref = None
+            if not ref:
+                ref = str(panel_id)
+            self._remember(ref, panel_id)
+            out.append({**u, "uuid": ref})
+        return out
+
     async def get_all_panel_users(
             self,
             page_size: int = 100,
@@ -360,12 +389,12 @@ class PanelApiService:
                 return None
             users_batch = response_data.get("response", {}).get("users", [])
             if not users_batch: break
-            all_users.extend(await self._with_refs(users_batch))
+            all_users.extend(users_batch)
             if len(users_batch) < page_size: break
             start_offset += page_size
             await asyncio.sleep(0.1)
         logging.info(f"Fetched {len(all_users)} users from panel API.")
-        return all_users
+        return await self._with_refs_bulk(all_users)
 
     async def get_user_by_uuid(
             self,

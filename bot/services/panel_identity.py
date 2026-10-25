@@ -6,9 +6,12 @@ is kept as-is (legacy uuids stay, new users get the id as a string) and this mod
 resolves a reference to the numeric id, persisting it in ``users.panel_user_id``.
 """
 import logging
-from typing import Dict, Optional, Protocol
+from typing import Dict, Optional, Protocol, Tuple
+
+from sqlalchemy import select
 
 from db.dal import user_dal
+from db.models import User
 
 
 def is_numeric_ref(ref: object) -> bool:
@@ -21,6 +24,9 @@ class PanelIdentityStore(Protocol):
     async def get_telegram_id(self, ref: str) -> Optional[int]: ...
     async def get_ref_by_telegram_id(self, telegram_id: int) -> Optional[str]: ...
     async def save_panel_id(self, ref: str, panel_id: int) -> None: ...
+    async def load_all(self) -> Tuple[Dict[int, str], Dict[int, str]]:
+        """(panel_id -> ref, telegram_id -> ref) for every linked local user; one pass, for bulk sync."""
+        ...
 
 
 class DbIdentityStore:
@@ -54,6 +60,19 @@ class DbIdentityStore:
                 user.panel_user_id = panel_id
                 await session.commit()
 
+    async def load_all(self) -> Tuple[Dict[int, str], Dict[int, str]]:
+        by_panel_id: Dict[int, str] = {}
+        by_telegram: Dict[int, str] = {}
+        async with self._session_factory() as session:
+            rows = await session.execute(
+                select(User.user_id, User.panel_user_uuid, User.panel_user_id).where(User.panel_user_uuid.isnot(None))
+            )
+            for user_id, ref, panel_id in rows:
+                by_telegram[int(user_id)] = ref
+                if panel_id is not None:
+                    by_panel_id[int(panel_id)] = ref
+        return by_panel_id, by_telegram
+
 
 class MemoryIdentityStore:
     """Dict-backed store for tests: ``users`` maps telegram_id -> {"ref": ..., "panel_id": ...}."""
@@ -83,6 +102,11 @@ class MemoryIdentityStore:
         u = self._by_ref(ref)
         if u is not None:
             u["panel_id"] = panel_id
+
+    async def load_all(self) -> Tuple[Dict[int, str], Dict[int, str]]:
+        by_panel_id = {int(u["panel_id"]): str(u["ref"]) for u in self.users.values() if u.get("panel_id") and u.get("ref")}
+        by_telegram = {int(tg): str(u["ref"]) for tg, u in self.users.items() if u.get("ref")}
+        return by_panel_id, by_telegram
 
 
 _store: Optional[PanelIdentityStore] = None
