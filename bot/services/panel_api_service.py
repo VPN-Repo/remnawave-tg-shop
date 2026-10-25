@@ -108,7 +108,12 @@ class PanelApiService:
         aiohttp_session = await self._get_session()
         headers = await self._prepare_headers()
 
-        url_for_request = f"{self.base_url.rstrip('/')}/{endpoint.lstrip('/')}"
+        # PANEL_API_URL may be given with or without the /api suffix (Leto's install has none);
+        # the REST API always lives under /api, subscription links (/sub/...) do not.
+        api_base = self.base_url.rstrip('/')
+        if not api_base.endswith('/api'):
+            api_base += '/api'
+        url_for_request = f"{api_base}/{endpoint.lstrip('/')}"
 
         current_params = kwargs.get("params")
         url_with_params_for_log = url_for_request
